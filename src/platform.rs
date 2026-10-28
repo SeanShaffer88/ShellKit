@@ -29,6 +29,38 @@ pub fn backend() -> ShResult<Box<dyn RegistryBackend>> {
     ))
 }
 
+/// Replace an app's custom jump list with `tasks` (Windows
+/// only, via the DestinationList COM surface in `com`).
+#[cfg(windows)]
+pub fn apply_jump_list(app_id: &str, tasks: &[crate::JumpTask]) -> ShResult<()> {
+    com::apply_jump_list(app_id, tasks)
+}
+
+#[cfg(not(windows))]
+pub fn apply_jump_list(_app_id: &str, _tasks: &[crate::JumpTask]) -> ShResult<()> {
+    Err((
+        crate::ERR_NOT_SUPPORTED,
+        "applying a jump list is only available on Windows (planning works on every platform)"
+            .to_string(),
+    ))
+}
+
+/// Clear an app's custom jump list entirely — this is what
+/// restoring a jump-list backup means (Windows only).
+#[cfg(windows)]
+pub fn delete_jump_list(app_id: &str) -> ShResult<()> {
+    com::delete_jump_list(app_id)
+}
+
+#[cfg(not(windows))]
+pub fn delete_jump_list(_app_id: &str) -> ShResult<()> {
+    Err((
+        crate::ERR_NOT_SUPPORTED,
+        "clearing a jump list (restoring a jump-list backup) is only available on Windows"
+            .to_string(),
+    ))
+}
+
 #[cfg(windows)]
 mod win {
     use super::RegistryBackend;
@@ -396,5 +428,592 @@ mod win {
                 )),
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Jump lists: the DestinationList COM surface.
+//
+// Everything below was checked against the `windows` crate's
+// generated bindings before it was written — vtable layouts are
+// ABI, and a wrong slot calls the wrong method silently:
+//
+// - ICustomDestinationList vtable (windows crate docs,
+//   Windows::Win32::UI::Shell, ICustomDestinationList_Vtbl):
+//   after IUnknown — SetAppID, BeginList, AppendCategory,
+//   AppendKnownCategory, AddUserTasks, CommitList,
+//   GetRemovedDestinations, DeleteList, AbortList. Nine
+//   methods; there is NO AddCustomCategory in this interface,
+//   and CommitList comes right after AddUserTasks.
+// - IShellLinkW vtable (same source, IShellLinkW_Vtbl):
+//   GetPath, GetIDList, SetIDList, GetDescription,
+//   SetDescription, GetWorkingDirectory, SetWorkingDirectory,
+//   GetArguments, SetArguments, GetHotkey, SetHotkey,
+//   GetShowCmd, SetShowCmd, GetIconLocation, SetIconLocation,
+//   SetRelativePath, Resolve, SetPath.
+// - IPropertyStore vtable (windows crate docs,
+//   Windows::Win32::UI::Shell::PropertiesSystem,
+//   IPropertyStore_Vtbl): GetCount, GetAt, GetValue, SetValue,
+//   Commit.
+// - IObjectArray / IObjectCollection (objectarray.h): the
+//   array is GetCount, GetAt; the collection extends it with
+//   AddObject, AddFromArray, RemoveObjectAt, Clear.
+// - GUIDs are the SDK values (shobjidl_core.h / objbase.h /
+//   propsys.h, as projected by the windows crate):
+//   CLSID_DestinationList, CLSID_ShellLink,
+//   CLSID_EnumerableObjectCollection and the interface IIDs.
+// - PKEY_Title is {F29F85E0-4FF9-1068-AB91-08002B27B3D9}:2
+//   (propkey.h; windows crate PropertiesSystem::PKEY_Title),
+//   and a task title is a VT_LPWSTR (31) PROPVARIANT.
+//
+// ole32's entry points are resolved dynamically
+// (LoadLibraryW/GetProcAddress) so this module adds NO import
+// library dependency. kernel32 itself is declared with the
+// house #[link] rule like every other extern block.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod com {
+    use crate::{JumpTask, ShResult, ERR_PLATFORM};
+    use std::ffi::c_void;
+
+    type HResult = i32;
+
+    const S_OK: HResult = 0;
+    const RPC_E_CHANGED_MODE: HResult = 0x8001_0106u32 as i32;
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const CLSCTX_INPROC_SERVER: u32 = 0x1;
+    const VT_LPWSTR: u16 = 31;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+
+    const CLSID_DESTINATION_LIST: Guid = Guid {
+        data1: 0x77f1_0cf0,
+        data2: 0x3db5,
+        data3: 0x4966,
+        data4: [0xb5, 0x20, 0xb7, 0xc5, 0x4f, 0xd3, 0x5e, 0xd6],
+    };
+    const IID_CUSTOM_DESTINATION_LIST: Guid = Guid {
+        data1: 0x6332_debf,
+        data2: 0x87b5,
+        data3: 0x4670,
+        data4: [0x90, 0xc0, 0x5e, 0x57, 0xb4, 0x08, 0xa4, 0x9e],
+    };
+    const CLSID_SHELL_LINK: Guid = Guid {
+        data1: 0x0002_1401,
+        data2: 0x0000,
+        data3: 0x0000,
+        data4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46],
+    };
+    const IID_SHELL_LINK_W: Guid = Guid {
+        data1: 0x0002_14f9,
+        data2: 0x0000,
+        data3: 0x0000,
+        data4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46],
+    };
+    const CLSID_ENUMERABLE_OBJECT_COLLECTION: Guid = Guid {
+        data1: 0x2d34_68c1,
+        data2: 0x36a7,
+        data3: 0x43b6,
+        data4: [0xac, 0x24, 0xd3, 0xf0, 0x2f, 0xd9, 0x60, 0x7a],
+    };
+    const IID_OBJECT_COLLECTION: Guid = Guid {
+        data1: 0x5632_b1a4,
+        data2: 0xe38a,
+        data3: 0x400a,
+        data4: [0x92, 0x8a, 0xd4, 0xcd, 0x63, 0x23, 0x02, 0x95],
+    };
+    const IID_OBJECT_ARRAY: Guid = Guid {
+        data1: 0x92ca_9dcd,
+        data2: 0x5622,
+        data3: 0x4bba,
+        data4: [0xa8, 0x05, 0x5e, 0x9f, 0x54, 0x1b, 0xd8, 0xc9],
+    };
+    const IID_PROPERTY_STORE: Guid = Guid {
+        data1: 0x886d_8eeb,
+        data2: 0x8cf2,
+        data3: 0x4446,
+        data4: [0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99],
+    };
+
+    #[repr(C)]
+    struct PropertyKey {
+        fmtid: Guid,
+        pid: u32,
+    }
+
+    /// System.Title — the property a jump-list task's display
+    /// text lives in.
+    const PKEY_TITLE: PropertyKey = PropertyKey {
+        fmtid: Guid {
+            data1: 0xf29f_85e0,
+            data2: 0x4ff9,
+            data3: 0x1068,
+            data4: [0xab, 0x91, 0x08, 0x00, 0x2b, 0x27, 0xb3, 0xd9],
+        },
+        pid: 2,
+    };
+
+    /// PROPVARIANT with the layout of propidl.h: the VARTYPE,
+    /// three reserved words, then the union (the string pointer
+    /// for VT_LPWSTR). The trailing `usize` pads the struct to
+    /// the real PROPVARIANT size on both 32- and 64-bit (the
+    /// union's largest member, BLOB, is two words).
+    #[repr(C)]
+    struct PropVariant {
+        vt: u16,
+        reserved1: u16,
+        reserved2: u16,
+        reserved3: u16,
+        pwsz_val: *const u16,
+        _pad: usize,
+    }
+
+    // Vtable slots (IUnknown occupies 0..=2 everywhere).
+    const SLOT_QUERY_INTERFACE: usize = 0;
+    const SLOT_RELEASE: usize = 2;
+    // ICustomDestinationList
+    const CDL_SET_APP_ID: usize = 3;
+    const CDL_BEGIN_LIST: usize = 4;
+    const CDL_ADD_USER_TASKS: usize = 7;
+    const CDL_COMMIT_LIST: usize = 8;
+    const CDL_DELETE_LIST: usize = 10;
+    const CDL_ABORT_LIST: usize = 11;
+    // IShellLinkW
+    const SL_SET_DESCRIPTION: usize = 7;
+    const SL_SET_ARGUMENTS: usize = 11;
+    const SL_SET_ICON_LOCATION: usize = 17;
+    const SL_SET_PATH: usize = 20;
+    // IObjectCollection (IObjectArray's GetCount/GetAt are 3/4)
+    const OC_ADD_OBJECT: usize = 5;
+    // IPropertyStore
+    const PS_SET_VALUE: usize = 6;
+    const PS_COMMIT: usize = 7;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+
+    type CoInitializeExFn =
+        unsafe extern "system" fn(reserved: *mut c_void, co_init: u32) -> HResult;
+    type CoUninitializeFn = unsafe extern "system" fn();
+    type CoCreateInstanceFn = unsafe extern "system" fn(
+        rclsid: *const Guid,
+        outer: *mut c_void,
+        cls_context: u32,
+        riid: *const Guid,
+        result: *mut *mut c_void,
+    ) -> HResult;
+
+    struct Ole32 {
+        co_initialize_ex: CoInitializeExFn,
+        co_uninitialize: CoUninitializeFn,
+        co_create_instance: CoCreateInstanceFn,
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn hr_err(what: &str, hr: HResult) -> (i32, String) {
+        (
+            ERR_PLATFORM,
+            format!("{what} failed: HRESULT 0x{:08X}", hr as u32),
+        )
+    }
+
+    fn check(what: &str, hr: HResult) -> ShResult<()> {
+        if hr == S_OK {
+            Ok(())
+        } else {
+            Err(hr_err(what, hr))
+        }
+    }
+
+    fn load_ole32() -> ShResult<Ole32> {
+        let name = wide("ole32.dll");
+        let module = unsafe { LoadLibraryW(name.as_ptr()) };
+        if module.is_null() {
+            return Err((
+                ERR_PLATFORM,
+                "could not load ole32.dll to reach the COM runtime".to_string(),
+            ));
+        }
+        // The module stays loaded for the process lifetime by
+        // design: the resolved pointers must outlive every call
+        // below, and ole32 is a system DLL that is always safe
+        // to keep mapped.
+        unsafe fn resolve<T>(module: *mut c_void, proc: &[u8]) -> ShResult<T> {
+            let p = unsafe { GetProcAddress(module, proc.as_ptr()) };
+            if p.is_null() {
+                return Err((
+                    ERR_PLATFORM,
+                    format!(
+                        "ole32.dll has no {} entry point",
+                        String::from_utf8_lossy(&proc[..proc.len() - 1])
+                    ),
+                ));
+            }
+            Ok(unsafe { std::mem::transmute_copy(&p) })
+        }
+        let co_initialize_ex: CoInitializeExFn = unsafe { resolve(module, b"CoInitializeEx\0") }?;
+        let co_uninitialize: CoUninitializeFn = unsafe { resolve(module, b"CoUninitialize\0") }?;
+        let co_create_instance: CoCreateInstanceFn =
+            unsafe { resolve(module, b"CoCreateInstance\0") }?;
+        Ok(Ole32 {
+            co_initialize_ex,
+            co_uninitialize,
+            co_create_instance,
+        })
+    }
+
+    /// A COM apartment for one apply/delete call. When the
+    /// calling thread already has an apartment of a DIFFERENT
+    /// model, CoInitializeEx reports RPC_E_CHANGED_MODE: COM
+    /// calls still work in the existing apartment, so proceed —
+    /// but that initialization is not ours, so it is not
+    /// balanced with a CoUninitialize on drop.
+    struct ComSession {
+        ole: Ole32,
+        uninit_owed: bool,
+    }
+
+    impl ComSession {
+        fn new() -> ShResult<ComSession> {
+            let ole = load_ole32()?;
+            let hr =
+                unsafe { (ole.co_initialize_ex)(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
+            if hr >= 0 {
+                // S_OK or S_FALSE: this call initialized (or
+                // counted) the apartment; balance it on drop.
+                Ok(ComSession {
+                    ole,
+                    uninit_owed: true,
+                })
+            } else if hr == RPC_E_CHANGED_MODE {
+                Ok(ComSession {
+                    ole,
+                    uninit_owed: false,
+                })
+            } else {
+                Err(hr_err("CoInitializeEx", hr))
+            }
+        }
+
+        fn create(&self, clsid: &Guid, iid: &Guid, what: &str) -> ShResult<ComPtr> {
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            let hr = unsafe {
+                (self.ole.co_create_instance)(
+                    clsid,
+                    std::ptr::null_mut(),
+                    CLSCTX_INPROC_SERVER,
+                    iid,
+                    &mut raw,
+                )
+            };
+            check(&format!("CoCreateInstance({what})"), hr)?;
+            if raw.is_null() {
+                return Err((
+                    ERR_PLATFORM,
+                    format!("CoCreateInstance({what}) returned a null interface"),
+                ));
+            }
+            Ok(ComPtr(raw))
+        }
+    }
+
+    impl Drop for ComSession {
+        fn drop(&mut self) {
+            if self.uninit_owed {
+                unsafe { (self.ole.co_uninitialize)() }
+            }
+        }
+    }
+
+    /// An owned interface pointer: released through its vtable
+    /// on drop.
+    struct ComPtr(*mut c_void);
+
+    impl Drop for ComPtr {
+        fn drop(&mut self) {
+            unsafe { release(self.0) }
+        }
+    }
+
+    unsafe fn vtable(p: *mut c_void) -> *const *const c_void {
+        unsafe { *(p as *const *const *const c_void) }
+    }
+
+    unsafe fn slot<T>(p: *mut c_void, index: usize) -> T {
+        unsafe {
+            let entry = *vtable(p).add(index);
+            std::mem::transmute_copy(&entry)
+        }
+    }
+
+    unsafe fn release(p: *mut c_void) {
+        if !p.is_null() {
+            type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
+            let f: ReleaseFn = unsafe { slot(p, SLOT_RELEASE) };
+            unsafe { f(p) };
+        }
+    }
+
+    unsafe fn query_interface(p: *mut c_void, iid: &Guid, what: &str) -> ShResult<ComPtr> {
+        type QueryInterfaceFn =
+            unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> HResult;
+        let f: QueryInterfaceFn = unsafe { slot(p, SLOT_QUERY_INTERFACE) };
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        let hr = unsafe { f(p, iid, &mut raw) };
+        check(&format!("QueryInterface({what})"), hr)?;
+        if raw.is_null() {
+            return Err((
+                ERR_PLATFORM,
+                format!("QueryInterface({what}) returned a null interface"),
+            ));
+        }
+        Ok(ComPtr(raw))
+    }
+
+    // -- ICustomDestinationList calls -------------------------------------
+
+    unsafe fn cdl_set_app_id(list: *mut c_void, app_id: *const u16) -> HResult {
+        type Fn = unsafe extern "system" fn(*mut c_void, *const u16) -> HResult;
+        let f: Fn = unsafe { slot(list, CDL_SET_APP_ID) };
+        unsafe { f(list, app_id) }
+    }
+
+    unsafe fn cdl_begin_list(
+        list: *mut c_void,
+        min_slots: *mut u32,
+        removed: *mut *mut c_void,
+    ) -> HResult {
+        type Fn = unsafe extern "system" fn(
+            *mut c_void,
+            *mut u32,
+            *const Guid,
+            *mut *mut c_void,
+        ) -> HResult;
+        let f: Fn = unsafe { slot(list, CDL_BEGIN_LIST) };
+        unsafe { f(list, min_slots, &IID_OBJECT_ARRAY, removed) }
+    }
+
+    unsafe fn cdl_add_user_tasks(list: *mut c_void, tasks: *mut c_void) -> HResult {
+        type Fn = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HResult;
+        let f: Fn = unsafe { slot(list, CDL_ADD_USER_TASKS) };
+        unsafe { f(list, tasks) }
+    }
+
+    unsafe fn cdl_commit_list(list: *mut c_void) -> HResult {
+        type Fn = unsafe extern "system" fn(*mut c_void) -> HResult;
+        let f: Fn = unsafe { slot(list, CDL_COMMIT_LIST) };
+        unsafe { f(list) }
+    }
+
+    unsafe fn cdl_delete_list(list: *mut c_void, app_id: *const u16) -> HResult {
+        type Fn = unsafe extern "system" fn(*mut c_void, *const u16) -> HResult;
+        let f: Fn = unsafe { slot(list, CDL_DELETE_LIST) };
+        unsafe { f(list, app_id) }
+    }
+
+    unsafe fn cdl_abort_list(list: *mut c_void) -> HResult {
+        type Fn = unsafe extern "system" fn(*mut c_void) -> HResult;
+        let f: Fn = unsafe { slot(list, CDL_ABORT_LIST) };
+        unsafe { f(list) }
+    }
+
+    // -- IShellLinkW calls -------------------------------------------------
+
+    unsafe fn sl_set_path(link: *mut c_void, path: *const u16) -> HResult {
+        type Fn = unsafe extern "system" fn(*mut c_void, *const u16) -> HResult;
+        let f: Fn = unsafe { slot(link, SL_SET_PATH) };
+        unsafe { f(link, path) }
+    }
+
+    unsafe fn sl_set_arguments(link: *mut c_void, args: *const u16) -> HResult {
+        type Fn = unsafe extern "system" fn(*mut c_void, *const u16) -> HResult;
+        let f: Fn = unsafe { slot(link, SL_SET_ARGUMENTS) };
+        unsafe { f(link, args) }
+    }
+
+    unsafe fn sl_set_description(link: *mut c_void, description: *const u16) -> HResult {
+        type Fn = unsafe extern "system" fn(*mut c_void, *const u16) -> HResult;
+        let f: Fn = unsafe { slot(link, SL_SET_DESCRIPTION) };
+        unsafe { f(link, description) }
+    }
+
+    unsafe fn sl_set_icon_location(link: *mut c_void, icon: *const u16, index: i32) -> HResult {
+        type Fn = unsafe extern "system" fn(*mut c_void, *const u16, i32) -> HResult;
+        let f: Fn = unsafe { slot(link, SL_SET_ICON_LOCATION) };
+        unsafe { f(link, icon, index) }
+    }
+
+    // -- IObjectCollection / IPropertyStore calls ---------------------------
+
+    unsafe fn oc_add_object(collection: *mut c_void, object: *mut c_void) -> HResult {
+        type Fn = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HResult;
+        let f: Fn = unsafe { slot(collection, OC_ADD_OBJECT) };
+        unsafe { f(collection, object) }
+    }
+
+    unsafe fn ps_set_value(store: *mut c_void, key: &PropertyKey, value: &PropVariant) -> HResult {
+        type Fn = unsafe extern "system" fn(
+            *mut c_void,
+            *const PropertyKey,
+            *const PropVariant,
+        ) -> HResult;
+        let f: Fn = unsafe { slot(store, PS_SET_VALUE) };
+        unsafe { f(store, key, value) }
+    }
+
+    unsafe fn ps_commit(store: *mut c_void) -> HResult {
+        type Fn = unsafe extern "system" fn(*mut c_void) -> HResult;
+        let f: Fn = unsafe { slot(store, PS_COMMIT) };
+        unsafe { f(store) }
+    }
+
+    /// Build one task's shell link: target, optional arguments /
+    /// description / icon, and the title property the taskbar
+    /// displays. The title is set through the link's
+    /// IPropertyStore as PKEY_Title — without it the task does
+    /// not display at all, which is why the planner makes the
+    /// title mandatory.
+    fn make_task_link(session: &ComSession, task: &JumpTask) -> ShResult<ComPtr> {
+        let link = session.create(&CLSID_SHELL_LINK, &IID_SHELL_LINK_W, "IShellLinkW")?;
+        let target = wide(&task.target);
+        check("IShellLinkW::SetPath", unsafe {
+            sl_set_path(link.0, target.as_ptr())
+        })?;
+        if let Some(args) = &task.args {
+            let args = wide(args);
+            check("IShellLinkW::SetArguments", unsafe {
+                sl_set_arguments(link.0, args.as_ptr())
+            })?;
+        }
+        if let Some(description) = &task.description {
+            let description = wide(description);
+            check("IShellLinkW::SetDescription", unsafe {
+                sl_set_description(link.0, description.as_ptr())
+            })?;
+        }
+        if let Some(icon) = &task.icon {
+            let icon = wide(icon);
+            check("IShellLinkW::SetIconLocation", unsafe {
+                sl_set_icon_location(link.0, icon.as_ptr(), task.icon_index as i32)
+            })?;
+        }
+        let store = unsafe { query_interface(link.0, &IID_PROPERTY_STORE, "IPropertyStore") }?;
+        let title = wide(&task.title);
+        // IPropertyStore::SetValue copies the PROPVARIANT's
+        // contents synchronously (the windows crate binding
+        // takes it as a `*const PROPVARIANT`, and Microsoft's
+        // own jump-list sample passes a borrowed pwszVal the
+        // same way), so the title string is lent, not handed
+        // over: no CoTaskMem allocation, no PropVariantClear.
+        // The buffer outlives the call because it is a local
+        // and SetValue is synchronous.
+        let value = PropVariant {
+            vt: VT_LPWSTR,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            pwsz_val: title.as_ptr(),
+            _pad: 0,
+        };
+        check("IPropertyStore::SetValue(PKEY_Title)", unsafe {
+            ps_set_value(store.0, &PKEY_TITLE, &value)
+        })?;
+        check("IPropertyStore::Commit", unsafe { ps_commit(store.0) })?;
+        Ok(link)
+    }
+
+    /// Replace `app_id`'s custom jump list with `tasks`:
+    /// SetAppID, BeginList, one shell link per task in an object
+    /// collection, AddUserTasks, CommitList. A successful commit
+    /// replaces the previous custom list wholesale.
+    pub fn apply_jump_list(app_id: &str, tasks: &[JumpTask]) -> ShResult<()> {
+        let session = ComSession::new()?;
+        let list = session.create(
+            &CLSID_DESTINATION_LIST,
+            &IID_CUSTOM_DESTINATION_LIST,
+            "ICustomDestinationList",
+        )?;
+        let app_id_w = wide(app_id);
+        check("ICustomDestinationList::SetAppID", unsafe {
+            cdl_set_app_id(list.0, app_id_w.as_ptr())
+        })?;
+        // BeginList's ppv is a plain [out] parameter in the
+        // documentation — it is NOT documented as nullable — so
+        // it gets a real pointer (asking for the removed
+        // destinations as IObjectArray) and whatever comes back
+        // is released immediately; respecting removed items is
+        // the caller's data problem, not this apply's.
+        let mut min_slots: u32 = 0;
+        let mut removed_raw: *mut c_void = std::ptr::null_mut();
+        let hr = unsafe { cdl_begin_list(list.0, &mut min_slots, &mut removed_raw) };
+        let _removed = ComPtr(removed_raw);
+        check("ICustomDestinationList::BeginList", hr)?;
+        let result = apply_begun(&session, list.0, tasks);
+        if result.is_err() {
+            // End the building session cleanly; the error that
+            // caused the abort is the one that matters.
+            let _ = unsafe { cdl_abort_list(list.0) };
+        }
+        result
+    }
+
+    fn apply_begun(session: &ComSession, list: *mut c_void, tasks: &[JumpTask]) -> ShResult<()> {
+        let collection = session.create(
+            &CLSID_ENUMERABLE_OBJECT_COLLECTION,
+            &IID_OBJECT_COLLECTION,
+            "IObjectCollection",
+        )?;
+        for task in tasks {
+            let link = make_task_link(session, task)?;
+            check("IObjectCollection::AddObject", unsafe {
+                oc_add_object(collection.0, link.0)
+            })?;
+        }
+        // The collection IS an IObjectArray (it extends it), so
+        // its pointer is what AddUserTasks takes.
+        check("ICustomDestinationList::AddUserTasks", unsafe {
+            cdl_add_user_tasks(list, collection.0)
+        })?;
+        check("ICustomDestinationList::CommitList", unsafe {
+            cdl_commit_list(list)
+        })?;
+        Ok(())
+    }
+
+    /// Clear `app_id`'s custom jump list: DeleteList removes
+    /// the whole custom list (the shell falls back to its
+    /// standard generated list). DeleteList takes the app id as
+    /// its own parameter — the form an uninstaller in another
+    /// process uses; SetAppID is called first as well, matching
+    /// the sequence the interface documents for its other calls.
+    pub fn delete_jump_list(app_id: &str) -> ShResult<()> {
+        let session = ComSession::new()?;
+        let list = session.create(
+            &CLSID_DESTINATION_LIST,
+            &IID_CUSTOM_DESTINATION_LIST,
+            "ICustomDestinationList",
+        )?;
+        let app_id_w = wide(app_id);
+        check("ICustomDestinationList::SetAppID", unsafe {
+            cdl_set_app_id(list.0, app_id_w.as_ptr())
+        })?;
+        check("ICustomDestinationList::DeleteList", unsafe {
+            cdl_delete_list(list.0, app_id_w.as_ptr())
+        })?;
+        Ok(())
     }
 }

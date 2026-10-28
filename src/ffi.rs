@@ -88,7 +88,7 @@ fn guard_code<F: FnOnce() -> c_int>(f: F) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn sh_version() -> *const c_char {
-    static VERSION_C: &[u8] = b"0.1.0\0";
+    static VERSION_C: &[u8] = b"0.2.0\0";
     VERSION_C.as_ptr() as *const c_char
 }
 
@@ -134,6 +134,14 @@ pub extern "C" fn sh_plan_association(spec_json: *const c_char) -> *mut c_char {
 pub extern "C" fn sh_plan_protocol(spec_json: *const c_char) -> *mut c_char {
     guard_json(|| {
         let inner = cstr(spec_json, "spec_json").and_then(crate::plan_protocol);
+        out_json(inner)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn sh_plan_jump_list(spec_json: *const c_char) -> *mut c_char {
+    guard_json(|| {
+        let inner = cstr(spec_json, "spec_json").and_then(crate::plan_jump_list);
         out_json(inner)
     })
 }
@@ -272,6 +280,65 @@ mod tests {
             assert!(!backup.is_null());
             let backup = take(backup);
             assert_eq!(sh_restore(cs(&backup).as_ptr()), SH_OK as c_int);
+        }
+    }
+
+    #[test]
+    fn ffi_jump_list_contract() {
+        // Planning is pure and works everywhere.
+        let plan = take(sh_plan_jump_list(
+            cs(concat!(
+                "{\"app_id\":\"ShellKit.FfiTest\",\"tasks\":[",
+                "{\"title\":\"Open\",\"target\":\"C:\\\\Tools\\\\myapp.exe\"}]}"
+            ))
+            .as_ptr(),
+        ));
+        let v = crate::json::parse(&plan).unwrap();
+        assert_eq!(v.get("kind").unwrap().as_str(), Some("jump_list"));
+        assert_eq!(sh_last_error_code(), SH_OK as c_int);
+        // Bad specs fail the documented way.
+        assert!(sh_plan_jump_list(std::ptr::null()).is_null());
+        assert_eq!(sh_last_error_code(), ERR_INVALID_ARG as c_int);
+        assert!(sh_plan_jump_list(cs("{\"app_id\":\"X\",\"tasks\":[]}").as_ptr()).is_null());
+        assert_eq!(sh_last_error_code(), ERR_INVALID_ARG as c_int);
+
+        let backup = sh_apply(cs(&plan).as_ptr());
+        #[cfg(not(windows))]
+        {
+            assert!(backup.is_null());
+            assert_eq!(sh_last_error_code(), crate::ERR_NOT_SUPPORTED as c_int);
+            // Restoring a jump-list backup off Windows is the
+            // same documented NOT_SUPPORTED (the backup shape is
+            // validated first, so this is not an argument error).
+            let rc = sh_restore(
+                cs("{\"kind\":\"jump_list\",\"app_id\":\"ShellKit.FfiTest\",\"previous\":\"unknown\"}")
+                    .as_ptr(),
+            );
+            assert_eq!(rc, crate::ERR_NOT_SUPPORTED as c_int);
+            // A jump-list backup without an app_id is an
+            // argument error on every platform.
+            let rc = sh_restore(cs("{\"kind\":\"jump_list\"}").as_ptr());
+            assert_eq!(rc, ERR_INVALID_ARG as c_int);
+        }
+        #[cfg(windows)]
+        {
+            // On Windows the apply talks to the real shell. If it
+            // succeeds, restoring the backup (which clears the
+            // list) must succeed too; if the environment refuses
+            // (no interactive session, say), the failure must be
+            // a platform error carrying the HRESULT, never a
+            // fake success or an argument error — the plan was
+            // valid. The runtime behaviour itself is only proven
+            // by a real taskbar; see QUALITY.md.
+            if backup.is_null() {
+                assert_eq!(sh_last_error_code(), crate::ERR_PLATFORM as c_int);
+            } else {
+                let backup = take(backup);
+                let bv = crate::json::parse(&backup).unwrap();
+                assert_eq!(bv.get("kind").unwrap().as_str(), Some("jump_list"));
+                assert_eq!(bv.get("previous").unwrap().as_str(), Some("unknown"));
+                assert_eq!(sh_restore(cs(&backup).as_ptr()), SH_OK as c_int);
+            }
         }
     }
 }

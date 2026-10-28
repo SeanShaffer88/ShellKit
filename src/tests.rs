@@ -697,3 +697,227 @@ fn regop_json_round_trip() {
         other => panic!("wrong op: {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Jump lists: planner goldens, spec validation, apply/restore
+// dispatch. Planning and validation run on every platform; the
+// COM apply itself is Windows-only and NOT_SUPPORTED elsewhere.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jump_list_plan_golden_full_and_minimal() {
+    let plan = plan_jump_list(
+        r#"{"app_id":"MyApp","tasks":[{"title":"New Document","target":"C:\\Tools\\myapp.exe","args":"--new","description":"Create a new document","icon":"C:\\Tools\\myapp.exe","icon_index":2},{"title":"Open","target":"C:\\Tools\\myapp.exe"}]}"#,
+    )
+    .unwrap();
+    let expected = concat!(
+        "{\"version\":1,\"kind\":\"jump_list\",\"app_id\":\"MyApp\",\"tasks\":[",
+        "{\"title\":\"New Document\",\"target\":\"C:\\\\Tools\\\\myapp.exe\",\"args\":\"--new\",\"description\":\"Create a new document\",\"icon\":\"C:\\\\Tools\\\\myapp.exe\",\"icon_index\":2},",
+        "{\"title\":\"Open\",\"target\":\"C:\\\\Tools\\\\myapp.exe\"}",
+        "],\"warnings\":[]}"
+    );
+    assert_eq!(plan, expected);
+
+    // Minimal spec: only the required fields survive, nothing
+    // optional is invented.
+    let plan = plan_jump_list(
+        r#"{"app_id":"MyApp","tasks":[{"title":"Open","target":"C:\\Tools\\myapp.exe"}]}"#,
+    )
+    .unwrap();
+    let expected = concat!(
+        "{\"version\":1,\"kind\":\"jump_list\",\"app_id\":\"MyApp\",\"tasks\":[",
+        "{\"title\":\"Open\",\"target\":\"C:\\\\Tools\\\\myapp.exe\"}",
+        "],\"warnings\":[]}"
+    );
+    assert_eq!(plan, expected);
+}
+
+#[test]
+fn jump_list_plan_normalizes_and_accepts_path_forms() {
+    // An icon without an explicit index normalizes to index 0.
+    let plan = plan_jump_list(
+        r#"{"app_id":"MyApp","tasks":[{"title":"Open","target":"C:\\Tools\\myapp.exe","icon":"C:\\Tools\\myapp.exe"}]}"#,
+    )
+    .unwrap();
+    assert!(plan.contains("\"icon_index\":0"), "{plan}");
+    // A negative icon index is an icon ID and is kept as-is.
+    let plan = plan_jump_list(
+        r#"{"app_id":"MyApp","tasks":[{"title":"Open","target":"C:\\Tools\\myapp.exe","icon":"C:\\Tools\\myapp.exe","icon_index":-2}]}"#,
+    )
+    .unwrap();
+    assert!(plan.contains("\"icon_index\":-2"), "{plan}");
+    // UNC targets and forward-slash drive targets are absolute.
+    let plan = plan_jump_list(
+        r#"{"app_id":"MyApp","tasks":[{"title":"Net","target":"\\\\server\\share\\app.exe"},{"title":"Fwd","target":"C:/Tools/app.exe"}]}"#,
+    )
+    .unwrap();
+    let v = json::parse(&plan).unwrap();
+    assert_eq!(
+        v.get("tasks").unwrap().as_array().unwrap()[0]
+            .get("target")
+            .unwrap()
+            .as_str(),
+        Some("\\\\server\\share\\app.exe")
+    );
+}
+
+#[test]
+fn jump_list_plan_rejects_bad_specs() {
+    let one_task = r#"[{"title":"T","target":"C:\\a.exe"}]"#;
+    let bad_specs: Vec<String> = vec![
+        // Missing / empty identity and task list.
+        "{}".into(),
+        format!(r#"{{"app_id":"","tasks":{one_task}}}"#),
+        r#"{"app_id":"X"}"#.into(),
+        r#"{"app_id":"X","tasks":[]}"#.into(),
+        // Task shape errors.
+        r#"{"app_id":"X","tasks":[{"target":"C:\\a.exe"}]}"#.into(),
+        r#"{"app_id":"X","tasks":[{"title":"","target":"C:\\a.exe"}]}"#.into(),
+        r#"{"app_id":"X","tasks":[{"title":"T"}]}"#.into(),
+        // Relative targets: bare, subfolder, drive-relative, root-relative.
+        r#"{"app_id":"X","tasks":[{"title":"T","target":"a.exe"}]}"#.into(),
+        r#"{"app_id":"X","tasks":[{"title":"T","target":"sub\\a.exe"}]}"#.into(),
+        r#"{"app_id":"X","tasks":[{"title":"T","target":"C:a.exe"}]}"#.into(),
+        r#"{"app_id":"X","tasks":[{"title":"T","target":"\\a.exe"}]}"#.into(),
+        // Unknown fields, in the spec and in a task.
+        format!(r#"{{"app_id":"X","tasks":{one_task},"surprise":1}}"#),
+        r#"{"app_id":"X","tasks":[{"title":"T","target":"C:\\a.exe","surprise":1}]}"#.into(),
+        // Icon rules: index without an icon, relative icon,
+        // out-of-range index, wrong-typed index.
+        r#"{"app_id":"X","tasks":[{"title":"T","target":"C:\\a.exe","icon_index":1}]}"#.into(),
+        r#"{"app_id":"X","tasks":[{"title":"T","target":"C:\\a.exe","icon":"rel.ico"}]}"#.into(),
+        r#"{"app_id":"X","tasks":[{"title":"T","target":"C:\\a.exe","icon":"C:\\a.ico","icon_index":2147483648}]}"#.into(),
+        r#"{"app_id":"X","tasks":[{"title":"T","target":"C:\\a.exe","icon":"C:\\a.ico","icon_index":"0"}]}"#.into(),
+        // Wrong container types.
+        r#"{"app_id":"X","tasks":{}}"#.into(),
+        r#"{"app_id":"X","tasks":[7]}"#.into(),
+        // Duplicate keys are a parse error by design.
+        format!(r#"{{"app_id":"X","app_id":"Y","tasks":{one_task}}}"#),
+    ];
+    for bad in &bad_specs {
+        assert_eq!(plan_jump_list(bad).unwrap_err().0, ERR_INVALID_ARG, "{bad}");
+    }
+    // Eleven tasks: one over the shell's limit.
+    let mut tasks = String::new();
+    for i in 0..11 {
+        if i > 0 {
+            tasks.push(',');
+        }
+        tasks.push_str(&format!(r#"{{"title":"T{i}","target":"C:\\a.exe"}}"#));
+    }
+    let spec = format!(r#"{{"app_id":"X","tasks":[{tasks}]}}"#);
+    assert_eq!(plan_jump_list(&spec).unwrap_err().0, ERR_INVALID_ARG);
+    // Ten tasks is exactly at the limit and plans fine.
+    let mut tasks = String::new();
+    for i in 0..10 {
+        if i > 0 {
+            tasks.push(',');
+        }
+        tasks.push_str(&format!(r#"{{"title":"T{i}","target":"C:\\a.exe"}}"#));
+    }
+    assert!(plan_jump_list(&format!(r#"{{"app_id":"X","tasks":[{tasks}]}}"#)).is_ok());
+}
+
+#[test]
+fn jump_list_plan_parses_back_for_apply() {
+    let plan = plan_jump_list(
+        r#"{"app_id":"MyApp","tasks":[{"title":"Open","target":"C:\\Tools\\myapp.exe","args":"--open"}]}"#,
+    )
+    .unwrap();
+    let v = json::parse(&plan).unwrap();
+    let (app_id, tasks) = parse_jump_list_plan(&v).unwrap();
+    assert_eq!(app_id, "MyApp");
+    assert_eq!(
+        tasks,
+        vec![JumpTask {
+            title: "Open".into(),
+            target: "C:\\Tools\\myapp.exe".into(),
+            args: Some("--open".into()),
+            description: None,
+            icon: None,
+            icon_index: 0,
+        }]
+    );
+    // Hand-written plans are held to the same standard: wrong
+    // version, missing identity, bad tasks all refuse.
+    for bad in [
+        r#"{"version":2,"kind":"jump_list","app_id":"X","tasks":[{"title":"T","target":"C:\\a.exe"}]}"#,
+        r#"{"kind":"jump_list","tasks":[{"title":"T","target":"C:\\a.exe"}]}"#,
+        r#"{"kind":"jump_list","app_id":"X","tasks":[{"title":"T","target":"rel.exe"}]}"#,
+        r#"{"kind":"jump_list","app_id":"X","tasks":[]}"#,
+    ] {
+        let v = json::parse(bad).unwrap();
+        assert_eq!(
+            parse_jump_list_plan(&v).unwrap_err().0,
+            ERR_INVALID_ARG,
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn jump_list_backup_shape_is_honest() {
+    // The previous list cannot be read back through COM, so
+    // the backup records it as "unknown" — exactly this shape.
+    assert_eq!(
+        jump_list_backup_json("MyApp"),
+        "{\"kind\":\"jump_list\",\"app_id\":\"MyApp\",\"previous\":\"unknown\"}"
+    );
+    // An app id needing JSON escapes is escaped.
+    assert_eq!(
+        jump_list_backup_json("A\"B"),
+        "{\"kind\":\"jump_list\",\"app_id\":\"A\\\"B\",\"previous\":\"unknown\"}"
+    );
+}
+
+#[test]
+fn jump_list_apply_restore_dispatch() {
+    // Used only by the off-Windows block below: on Windows this
+    // test deliberately never applies for real (the FFI contract
+    // test covers the live path; see QUALITY.md).
+    let _plan = plan_jump_list(
+        r#"{"app_id":"MyApp","tasks":[{"title":"Open","target":"C:\\Tools\\myapp.exe"}]}"#,
+    )
+    .unwrap();
+    // Validation happens before any platform call, on every
+    // platform: malformed jump plans are argument errors.
+    assert_eq!(
+        apply(r#"{"kind":"jump_list","app_id":"X","tasks":[]}"#)
+            .unwrap_err()
+            .0,
+        ERR_INVALID_ARG
+    );
+    assert_eq!(
+        apply(r#"{"kind":"jump_list","tasks":[{"title":"T","target":"C:\\a.exe"}]}"#)
+            .unwrap_err()
+            .0,
+        ERR_INVALID_ARG
+    );
+    // A jump-list backup without an app_id is an argument
+    // error everywhere; with one, restore means "clear the
+    // list", which off Windows is NOT_SUPPORTED.
+    assert_eq!(
+        restore(r#"{"kind":"jump_list"}"#).unwrap_err().0,
+        ERR_INVALID_ARG
+    );
+    assert_eq!(
+        restore(r#"{"kind":"jump_list","app_id":""}"#)
+            .unwrap_err()
+            .0,
+        ERR_INVALID_ARG
+    );
+    #[cfg(not(windows))]
+    {
+        assert_eq!(apply(&_plan).unwrap_err().0, ERR_NOT_SUPPORTED);
+        assert_eq!(
+            restore(&jump_list_backup_json("MyApp")).unwrap_err().0,
+            ERR_NOT_SUPPORTED
+        );
+    }
+}
+
+#[test]
+fn version_is_0_2_0() {
+    assert_eq!(VERSION, "0.2.0");
+    assert_eq!((VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH), (0, 2, 0));
+}

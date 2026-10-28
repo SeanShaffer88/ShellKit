@@ -22,9 +22,9 @@ pub mod platform;
 #[cfg(test)]
 mod tests;
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 1;
+pub const VERSION_MINOR: u32 = 2;
 pub const VERSION_PATCH: u32 = 0;
 
 // Error codes (mirror include/shellkit.h).
@@ -513,6 +513,19 @@ fn opt_bool(v: &json::Value, field: &str) -> ShResult<Option<bool>> {
     }
 }
 
+fn opt_i64(v: &json::Value, field: &str) -> ShResult<Option<i64>> {
+    match v.get(field) {
+        None | Some(json::Value::Null) => Ok(None),
+        Some(other) => match other.as_i64() {
+            Some(n) => Ok(Some(n)),
+            None => invalid(format!(
+                "\"{field}\" must be an integer, got {}",
+                other.type_name()
+            )),
+        },
+    }
+}
+
 fn reject_unknown(v: &json::Value, allowed: &[&str]) -> ShResult<()> {
     if let Some(pairs) = v.as_object() {
         for (k, _) in pairs {
@@ -835,6 +848,237 @@ pub fn remove_plan(spec_json: &str) -> ShResult<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Jump lists. A jump list is NOT a registry registration: it is
+// built through the shell's DestinationList COM surface. The
+// plan is therefore a data description of that COM apply (an
+// app id plus a list of tasks), not registry ops — the plan /
+// backup contract is the same, the vocabulary is honest about
+// what apply will actually do.
+// ---------------------------------------------------------------------------
+
+/// The shell's practical per-app task limit: a jump list shows
+/// at most 10 user tasks, so a plan asking for more is a spec
+/// error, not a plan that silently truncates.
+pub const MAX_JUMP_TASKS: usize = 10;
+
+/// One jump-list task, normalized: the title the user sees, the
+/// program it launches, and its optional extras. `icon_index`
+/// is meaningful only when `icon` is set (the planner fills in
+/// 0 there when the spec omits it).
+#[derive(Clone, Debug, PartialEq)]
+pub struct JumpTask {
+    pub title: String,
+    pub target: String,
+    pub args: Option<String>,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    pub icon_index: i64,
+}
+
+impl JumpTask {
+    fn to_value(&self) -> json::Value {
+        let mut pairs: Vec<(&str, json::Value)> = vec![
+            ("title", json::s(&self.title)),
+            ("target", json::s(&self.target)),
+        ];
+        if let Some(args) = &self.args {
+            pairs.push(("args", json::s(args)));
+        }
+        if let Some(description) = &self.description {
+            pairs.push(("description", json::s(description)));
+        }
+        if let Some(icon) = &self.icon {
+            pairs.push(("icon", json::s(icon)));
+            pairs.push(("icon_index", json::Value::I64(self.icon_index)));
+        }
+        json::obj(pairs)
+    }
+}
+
+/// An Application User Model ID: the identity a jump list is
+/// filed under. Not a key path (nothing is sanitized into the
+/// registry here), but it must be a real, non-empty identifier.
+fn validate_app_id(raw: &str) -> ShResult<String> {
+    if raw.is_empty() {
+        return invalid("app_id must not be empty");
+    }
+    if raw.chars().count() > 1024 {
+        return invalid("app_id is longer than 1024 characters");
+    }
+    if raw.chars().any(|c| (c as u32) < 0x20 || c == '\u{7f}') {
+        return invalid("app_id contains a control character");
+    }
+    Ok(raw.to_string())
+}
+
+/// A jump-list target must be an absolute path: the shell
+/// resolves a task's target when the taskbar button is clicked,
+/// with no working directory of the caller's to lean on, so a
+/// relative target would be a plan that cannot do what it says.
+fn validate_absolute_path(what: &str, path: &str) -> ShResult<()> {
+    if path.is_empty() {
+        return invalid(format!("{what} must not be empty"));
+    }
+    let b = path.as_bytes();
+    let drive_absolute = b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/');
+    let unc_absolute = path.starts_with("\\\\");
+    if !drive_absolute && !unc_absolute {
+        return invalid(format!(
+            "{what} must be an absolute path (a drive path like \"C:\\\\Tools\\\\app.exe\" or a UNC path), got \"{path}\""
+        ));
+    }
+    Ok(())
+}
+
+const JUMP_FIELDS: &[&str] = &["app_id", "tasks"];
+const JUMP_TASK_FIELDS: &[&str] = &[
+    "title",
+    "target",
+    "args",
+    "description",
+    "icon",
+    "icon_index",
+];
+
+fn parse_jump_task(v: &json::Value) -> ShResult<JumpTask> {
+    if v.as_object().is_none() {
+        return invalid("each jump list task must be a JSON object");
+    }
+    reject_unknown(v, JUMP_TASK_FIELDS)?;
+    let title = req_str(v, "title")?;
+    if title.is_empty() {
+        return invalid(
+            "task \"title\" must not be empty: a jump list task without a title does not display",
+        );
+    }
+    let target = req_str(v, "target")?;
+    validate_absolute_path("task \"target\"", &target)?;
+    let args = opt_str(v, "args")?;
+    let description = opt_str(v, "description")?;
+    let icon = opt_str(v, "icon")?;
+    if let Some(icon) = &icon {
+        validate_absolute_path("task \"icon\"", icon)?;
+    }
+    let icon_index = opt_i64(v, "icon_index")?;
+    if icon_index.is_some() && icon.is_none() {
+        return invalid(
+            "\"icon_index\" requires \"icon\": an icon index with no icon path has no effect",
+        );
+    }
+    let icon_index = match icon_index {
+        Some(n) => {
+            if n < i32::MIN as i64 || n > i32::MAX as i64 {
+                return invalid("\"icon_index\" is out of range");
+            }
+            n
+        }
+        None => 0,
+    };
+    Ok(JumpTask {
+        title,
+        target,
+        args,
+        description,
+        icon,
+        icon_index,
+    })
+}
+
+/// Parse and validate the `tasks` array of a jump-list spec or
+/// plan. Specs and plans share this shape on purpose: a
+/// hand-written plan is held to exactly the standard the
+/// planner emits, the same way a registry plan's ops are
+/// re-validated at apply time.
+fn parse_jump_tasks(v: &json::Value) -> ShResult<Vec<JumpTask>> {
+    let arr = match v.get("tasks") {
+        Some(json::Value::Array(items)) => items,
+        Some(other) => {
+            return invalid(format!(
+                "\"tasks\" must be an array, got {}",
+                other.type_name()
+            ))
+        }
+        None => return invalid("missing required field \"tasks\""),
+    };
+    if arr.is_empty() {
+        return invalid(
+            "\"tasks\" must not be empty: a jump list with no tasks is a removal, not a plan (restore a jump-list backup to clear a list)",
+        );
+    }
+    if arr.len() > MAX_JUMP_TASKS {
+        return invalid(format!(
+            "\"tasks\" has {} entries: a jump list shows at most {MAX_JUMP_TASKS} tasks",
+            arr.len()
+        ));
+    }
+    arr.iter().map(parse_jump_task).collect()
+}
+
+fn jump_plan_json(app_id: &str, tasks: &[JumpTask]) -> String {
+    json::obj(vec![
+        ("version", json::Value::I64(1)),
+        ("kind", json::s("jump_list")),
+        ("app_id", json::s(app_id)),
+        (
+            "tasks",
+            json::Value::Array(tasks.iter().map(|t| t.to_value()).collect()),
+        ),
+        // Family consistency: every plan carries a warnings
+        // array. No warning heuristics apply to jump tasks (a
+        // target that is not an .exe is legitimate — documents
+        // and folders are valid task targets), so it stays empty.
+        ("warnings", json::Value::Array(Vec::new())),
+    ])
+    .to_json()
+}
+
+/// Plan a jump list: the custom task list on an application's
+/// taskbar button. Spec fields are documented in the header.
+/// Pure: no shell access, works on every platform.
+pub fn plan_jump_list(spec_json: &str) -> ShResult<String> {
+    let spec = parse_spec(spec_json)?;
+    reject_unknown(&spec, JUMP_FIELDS)?;
+    let app_id = validate_app_id(&req_str(&spec, "app_id")?)?;
+    let tasks = parse_jump_tasks(&spec)?;
+    Ok(jump_plan_json(&app_id, &tasks))
+}
+
+/// Validate a jump-list plan (as produced by
+/// [`plan_jump_list`], or hand-written to the same format) and
+/// return its contents for execution.
+fn parse_jump_list_plan(v: &json::Value) -> ShResult<(String, Vec<JumpTask>)> {
+    if let Some(version) = v.get("version") {
+        if version.as_i64() != Some(1) {
+            return invalid(format!(
+                "unsupported jump list plan version {}: this ShellKit writes version 1",
+                version.to_json()
+            ));
+        }
+    }
+    let app_id = validate_app_id(&req_str(v, "app_id")?)?;
+    let tasks = parse_jump_tasks(v)?;
+    Ok((app_id, tasks))
+}
+
+/// The backup an applied jump list returns. Unlike a registry
+/// backup it cannot describe the previous state: the
+/// DestinationList COM surface offers no way to read the
+/// current custom list back, so `"previous"` is honestly
+/// `"unknown"`, and restoring this backup clears the list
+/// (see [`restore`]) rather than recreating what was there.
+fn jump_list_backup_json(app_id: &str) -> String {
+    json::obj(vec![
+        ("kind", json::s("jump_list")),
+        ("app_id", json::s(app_id)),
+        ("previous", json::s("unknown")),
+    ])
+    .to_json()
+}
+
+// ---------------------------------------------------------------------------
 // Apply / restore entry points.
 // ---------------------------------------------------------------------------
 
@@ -855,12 +1099,7 @@ fn parse_ops(v: &json::Value, field: &str) -> ShResult<Vec<RegOp>> {
     arr.iter().map(RegOp::from_value).collect()
 }
 
-fn parse_plan(plan_json: &str) -> ShResult<Vec<RegOp>> {
-    let v = json::parse(plan_json)
-        .map_err(|e| (ERR_INVALID_ARG, format!("plan is not valid JSON: {e}")))?;
-    if v.as_object().is_none() {
-        return invalid("plan must be a JSON object");
-    }
+fn parse_plan_value(v: &json::Value) -> ShResult<Vec<RegOp>> {
     if let Some(root) = v.get("root") {
         if root.as_str() != Some("HKCU") {
             return invalid(
@@ -868,17 +1107,34 @@ fn parse_plan(plan_json: &str) -> ShResult<Vec<RegOp>> {
             );
         }
     }
-    parse_ops(&v, "ops")
+    parse_ops(v, "ops")
 }
 
-/// Apply a plan: execute its operations against the real registry
-/// (Windows only) and return the backup JSON — the undo operations
-/// that restore the exact prior state. Keep the backup; it is the
-/// only way back. On non-Windows this returns
-/// `ERR_NOT_SUPPORTED`; planning and backup inversion are pure
-/// and work everywhere.
+/// Apply a plan (Windows only) and return the backup JSON.
+///
+/// A registry plan executes its operations against the real
+/// registry and its backup carries the undo operations that
+/// restore the exact prior state. A jump-list plan
+/// (`"kind":"jump_list"`) instead REPLACES the app's whole
+/// custom jump list through the DestinationList COM surface,
+/// and its backup is
+/// `{"kind":"jump_list","app_id":...,"previous":"unknown"}` —
+/// the previous list cannot be read back through COM, so it is
+/// recorded as unknown rather than invented. Keep the backup;
+/// it is the only way back. On non-Windows this returns
+/// `ERR_NOT_SUPPORTED`; planning is pure and works everywhere.
 pub fn apply(plan_json: &str) -> ShResult<String> {
-    let ops = parse_plan(plan_json)?;
+    let v = json::parse(plan_json)
+        .map_err(|e| (ERR_INVALID_ARG, format!("plan is not valid JSON: {e}")))?;
+    if v.as_object().is_none() {
+        return invalid("plan must be a JSON object");
+    }
+    if v.get("kind").and_then(|k| k.as_str()) == Some("jump_list") {
+        let (app_id, tasks) = parse_jump_list_plan(&v)?;
+        platform::apply_jump_list(&app_id, &tasks)?;
+        return Ok(jump_list_backup_json(&app_id));
+    }
+    let ops = parse_plan_value(&v)?;
     let mut backend = platform::backend()?;
     let undo = execute_with_backup(&ops, &mut *backend)?;
     Ok(json::obj(vec![
@@ -891,13 +1147,22 @@ pub fn apply(plan_json: &str) -> ShResult<String> {
     .to_json())
 }
 
-/// Restore from a backup JSON produced by [`apply`]: runs its
-/// undo operations in order. Windows only, like `apply`.
+/// Restore from a backup JSON produced by [`apply`]. A registry
+/// backup's undo operations run in order, restoring the exact
+/// captured state. A jump-list backup
+/// (`"kind":"jump_list"`) cannot do that — the list it replaced
+/// is unrecoverable — so restoring it CLEARS the app's custom
+/// jump list entirely (the shell then shows its standard,
+/// system-generated list). Windows only, like `apply`.
 pub fn restore(backup_json: &str) -> ShResult<()> {
     let v = json::parse(backup_json)
         .map_err(|e| (ERR_INVALID_ARG, format!("backup is not valid JSON: {e}")))?;
     if v.as_object().is_none() {
         return invalid("backup must be a JSON object");
+    }
+    if v.get("kind").and_then(|k| k.as_str()) == Some("jump_list") {
+        let app_id = validate_app_id(&req_str(&v, "app_id")?)?;
+        return platform::delete_jump_list(&app_id);
     }
     let ops = parse_ops(&v, "undo_ops")?;
     let mut backend = platform::backend()?;
