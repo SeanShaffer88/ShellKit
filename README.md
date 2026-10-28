@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-ShellKit is the safe way to put your program into Windows Explorer: a right-click menu entry, a file type that opens with your program, or a `yourapp://` link that launches it. Instead of poking the registry directly and hoping, you first get a **plan** — a plain list of exactly which registry keys and values would change, which you can read, show, or store. When you say go, ShellKit writes down the current state of everything it is about to touch, makes the change, and hands you a **backup**; feeding that backup back undoes the change completely, restoring even values that were there before. It only ever writes to the current user's registry area (no admin rights, no touching other users or system-wide settings), and applying a plan can never run a program — a plan is data, not a script.
+ShellKit is the safe way to put your program into Windows Explorer: a right-click menu entry, a file type that opens with your program, or a `yourapp://` link that launches it. Instead of poking the registry directly and hoping, you first get a **plan** — a plain list of exactly which registry keys and values would change, which you can read, show, or store. When you say go, ShellKit writes down the current state of everything it is about to touch, makes the change, and hands you a **backup**; feeding that backup back undoes the change completely, restoring even values that were there before. It only ever writes to the current user's registry area (no admin rights, no touching other users or system-wide settings), and applying a plan can never run a program — a plan is data, not a script. Since v0.2 it also sets your program's **jump list** — the task shortcuts on its taskbar button ("New Document", "Open Recent", and so on). A jump list is not registry data, so its plan describes the change instead of listing registry operations; applying it replaces the whole custom list, and because the previous list cannot be read back, its backup honestly says so and restoring it clears the list rather than pretending to bring the old one back.
 
 ```c
 #include "shellkit.h"
@@ -38,7 +38,8 @@ int main(void) {
 - **Sanitized names.** Verb names, extensions, ProgIDs and scheme names are validated before they become key paths: backslashes, slashes, control characters, leading dots where they would be wrong, empty ProgID segments and schemes that do not start with a letter are all rejected with a specific error.
 - **Honest warnings.** A command template without the `%1` placeholder — the classic "my program opens but never gets the file" bug — produces a warning in the plan. It stays a warning, because fixed-argument commands are legitimate.
 - **Removal is a plan too.** `sh_remove_plan` builds the delete plan for a registration from the same spec, so removing a verb, association or protocol is backed up and restorable exactly like registering one. Removing an association unlinks the extension and deletes the ProgID key; the extension key itself is left in place, because other values may live under it.
-- **Zero dependencies.** Hand-rolled JSON (duplicate keys in one object are a parse error, by design), hand-declared advapi32 bindings, small C ABI.
+- **Jump lists (v0.2).** `sh_plan_jump_list` plans an app's custom taskbar jump list: an `app_id` (the Application User Model ID the app's windows carry) plus 1 to 10 tasks, each with a title, an absolute target path, and optional arguments, description (tooltip) and icon. Applying the plan replaces the app's custom jump list wholesale through the shell's DestinationList COM surface — the previous custom list is removed, not merged. The backup records `"previous":"unknown"` because the old list cannot be read back through COM; restoring it clears the custom list entirely, after which Windows shows its standard generated list.
+- **Zero dependencies.** Hand-rolled JSON (duplicate keys in one object are a parse error, by design), hand-declared Win32 bindings (advapi32 linked; ole32 resolved at runtime for the jump-list COM work), small C ABI.
 
 ## The API in one screen
 
@@ -48,6 +49,7 @@ int main(void) {
 | `sh_plan_association(spec_json)` | Plan an extension → ProgID association; returns plan JSON |
 | `sh_plan_protocol(spec_json)` | Plan a URL protocol handler; returns plan JSON |
 | `sh_remove_plan(spec_json)` | Plan removing a registration (`"kind"` field selects which) |
+| `sh_plan_jump_list(spec_json)` | Plan an app's custom jump list (1–10 tasks); returns a `"kind":"jump_list"` plan |
 | `sh_apply(plan_json)` | Apply a plan (Windows); returns backup JSON |
 | `sh_restore(backup_json)` | Undo an apply from its backup; returns an `SH_*` code |
 | `sh_version` / `sh_last_error` / `sh_last_error_code` / `sh_free_string` | Version, thread-local error, string ownership |
@@ -67,6 +69,14 @@ Verb targets: `extension` (that extension's key), `file` (`*`, all files), `fold
 
 An association creates the extension key pointing at the ProgID, the ProgID key with its friendly name, an optional `DefaultIcon`, and `shell\open\command`. A protocol creates the scheme key, sets its description and the `URL Protocol` marker value the shell requires, and `shell\open\command`.
 
+A jump-list plan is not registry operations — a jump list lives behind the shell's COM surface, so the plan is the normalized task list itself:
+
+```json
+{"version":1,"kind":"jump_list","app_id":"MyCompany.MyApp","tasks":[{"title":"New Document","target":"C:\\Tools\\myapp.exe","args":"--new"}],"warnings":[]}
+```
+
+Applying it replaces the app's custom jump list with exactly these tasks. The app must run with the same `app_id` as its Application User Model ID for the shell to show the list on its taskbar button.
+
 ## Build
 
 ```sh
@@ -81,4 +91,4 @@ Rust 1.80+, edition 2021, no dependencies. The planners and the backup-inversion
 - Per-user registrations only: there is deliberately no HKLM (all-users) mode.
 - Values are strings (`REG_SZ`, and `REG_EXPAND_SZ` when restoring one). A subtree containing any other value type cannot be backed up, so an apply that would delete or overwrite it is refused rather than done lossily.
 - Registrations are the classic `Software\Classes` kind. Packaged-app (MSIX) shell extensions, which are manifest-declared, are out of scope.
-- Jump lists are not in v0.1 — see ROADMAP.md.
+- Jump lists: at most 10 tasks (the shell's practical limit — more is a planner error, not a silent truncation); applying replaces the custom list wholesale; the previous custom list cannot be read back, so a jump-list backup restores by clearing the list, not by restoring the old tasks. Only the Tasks section is set; recent/frequent documents and custom categories remain the shell's own.
