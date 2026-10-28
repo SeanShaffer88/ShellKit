@@ -1,12 +1,13 @@
 # ShellKit — Parity (spec vs implementation)
 
 Evidence: the Rust test suite in `src/tests.rs`, `src/ffi.rs`
-and `src/json.rs` (25 tests, all passing at the v0.1.0 gate)
+and `src/json.rs` (33 tests, all passing at the v0.2.0 gate)
 plus the header contract in `include/shellkit.h`. "Verified"
 means a named test exercises the behaviour. The Windows
-registry backend compiles under the `x86_64-pc-windows-msvc`
-target at the gate but has never executed — every row that
-needs a real registry is marked accordingly, not claimed.
+backends (registry and jump-list COM) compile under the
+`x86_64-pc-windows-msvc` target at the gate but have never
+executed — every row that needs a real registry or a real
+shell is marked accordingly, not claimed.
 
 | Spec feature | Status | Evidence |
 |---|---|---|
@@ -26,8 +27,15 @@ needs a real registry is marked accordingly, not claimed.
 | Windows apply: RegCreateKeyExW / RegSetValueExW writes under HKCU | Implemented, Unverified | `src/platform.rs` compiles + clippies for `x86_64-pc-windows-msvc`; never linked or run — CI's Windows build + a field test are the evidence still owed |
 | Windows backup read: RegOpenKeyExW / RegEnumValueW / RegEnumKeyExW subtree snapshot, incl. REG_EXPAND_SZ type preservation and refusal on non-string types | Implemented, Unverified | Same as above; the inversion logic it feeds is verified against the fake |
 | Windows delete: RegDeleteTreeW / RegDeleteValueW | Implemented, Unverified | Same as above |
+| Jump-list planner: app_id + 1–10 tasks → `{"version":1,"kind":"jump_list",...}` plan with normalized tasks | Verified | `jump_list_plan_golden_full_and_minimal`, `jump_list_plan_normalizes_and_accepts_path_forms` (icon index defaults to 0, negative index kept, UNC + forward-slash drive targets accepted) |
+| Jump-list spec validation: non-empty app_id/title, absolute target + icon paths (drive-relative and root-relative rejected), icon_index requires icon and must fit i32, unknown spec/task fields rejected, duplicate keys are a parse error | Verified | `jump_list_plan_rejects_bad_specs` (20 spec shapes + the 10/11 task boundary) |
+| Jump-list plan parse for apply: planner output round-trips; hand-written plans held to the same standard (version must be 1) | Verified | `jump_list_plan_parses_back_for_apply` |
+| Jump-list backup shape: `{"kind":"jump_list","app_id":...,"previous":"unknown"}` with correct JSON escaping | Verified | `jump_list_backup_shape_is_honest` |
+| Jump-list apply/restore dispatch: validation precedes any platform call on every platform; off Windows apply and restore return `ERR_NOT_SUPPORTED` | Verified | `jump_list_apply_restore_dispatch`, `ffi_jump_list_contract` (non-Windows branch) |
+| Windows jump-list apply: DestinationList COM sequence (SetAppID, BeginList, per-task IShellLinkW with PKEY_Title via IPropertyStore, AddUserTasks, CommitList), wholesale replace | Implemented, Unverified | `src/platform.rs` `com` module compiles + clippies for `x86_64-pc-windows-msvc`; GUIDs and vtable slots checked against the `windows` crate's generated bindings (sources cited in code). Never run — only a real Windows taskbar can prove it |
+| Windows jump-list restore: DeleteList clears the app's custom list | Implemented, Unverified | Same as above |
 
 ## Known gaps (also in README "Limitations")
-- Jump lists are roadmap, not v0.1 (see ROADMAP.md item 1) — deliberately absent rather than faked through registry ops.
+- Jump lists cover the Tasks section only: custom categories, recent/frequent documents, and honouring the user's removed-destinations list are not implemented. The previous custom list cannot be read back through COM, so a jump-list restore clears rather than restores — by the surface's design, stated in the backup itself (`"previous":"unknown"`).
 - Non-string registry values cannot be represented in a backup; a Windows apply whose delete/overwrite would touch one is refused by the snapshot step.
 - No HKLM mode, no `UserChoice` writing — by design, not omission.
